@@ -1,19 +1,24 @@
 function csi_preprocess_window_export_v2(varargin)
 % CSI Preprocess & Windowing (2.4 GHz default) with Phase Export
 % - Parses PicoScenes/PMT .csi via parseCSIFile.m
-% - Time windows (WinSec/HopSec), drop by MinFillRatio
+% - Time or packet indexed windows, drop by MinFillRatio
 % - Per-window amplitude: Hampel -> SG/Wavelet -> clip -> trim/subsample
 % - Phase pipeline added:
 %   * per-packet: unwrap(k) -> linear slope remove (CSD/SFO) -> CPE removal
 %   * optional: temporal unwrap over time + gentle high-pass
+%   * optional: export sin/cos features & amplitude+phase stacks for PreCNN
 % - Exports:
-%     X_window_%05d.npy         (amplitude, float32)
-%     Xphase_window_%05d.npy    (phase, float32, radians after sanitization)
+%     X_window_%05d.npy                (amplitude, float32)
+%     Xphase_window_%05d.npy           (phase, float32, radians after sanitization)
+%     XphaseSC_window_%05d.npy         (phase sin/cos, float32, optional)
+%     Xfeat_window_%05d.npy            (amp+phase stack [T x S x 3], optional)
 %     meta_%05d.mat
 %
 % REQUIRE: parseCSIFile.m in path.
 
 %% ---------------- Params ----------------
+validPhaseModes = {'raw','sincos','raw+sincos'};
+
 p = inputParser;
 addParameter(p,'OutDir','', @ischar);                 % default: <folder>/<basename>
 addParameter(p,'UseCF_CBW_Filter',true, @islogical);  % try CF≈TargetCF & CBW=TargetCBW
@@ -25,6 +30,10 @@ addParameter(p,'TargetCBW',20, @isscalar);            % MHz band
 addParameter(p,'WinSec',3, @isscalar);
 addParameter(p,'HopSec',0.5, @isscalar);
 addParameter(p,'MinFillRatio',0.60, @isscalar);
+
+% Packet-count windowing overrides (useful for small [T x S] windows)
+addParameter(p,'WinPackets',[], @(x) isempty(x) || (isscalar(x) && x>=1));
+addParameter(p,'HopPackets',[], @(x) isempty(x) || (isscalar(x) && x>=1));
 
 % Sampling assumptions if timestamp missing/unstable
 addParameter(p,'AssumedPktRate',800, @isscalar);      % pps
@@ -46,6 +55,8 @@ addParameter(p,'SubsampleStep',1, @isscalar);
 addParameter(p,'ExportPhase',true, @islogical);
 addParameter(p,'DoTemporalUnwrap',true, @islogical);
 addParameter(p,'PhaseHighpassHz',0.05, @isscalar);    % 0 disables HP
+addParameter(p,'PhaseOutputMode','raw', @(s) ischar(s) || isstring(s));
+addParameter(p,'ExportAmpPhaseStack',false, @islogical);
 
 % Labels & meta
 addParameter(p,'SessionID','', @ischar);
@@ -57,6 +68,7 @@ addParameter(p,'Verbose',true, @islogical);
 
 parse(p, varargin{:});
 opt = p.Results;
+opt.PhaseOutputMode = lower(char(validatestring(opt.PhaseOutputMode, validPhaseModes)));
 
 %% ---------------- File select ----------------
 [filename, pathname] = uigetfile('*.csi', 'Select a CSI file');
@@ -231,7 +243,8 @@ if opt.Verbose
 end
 
 %% ---- Build Phase matrix PHI [T x Nsc] (sanitized)
-if opt.ExportPhase
+wantPhase = opt.ExportPhase || opt.ExportAmpPhaseStack || contains(opt.PhaseOutputMode,'sincos');
+if wantPhase
     PHI = zeros(T, Nsc, 'double');
     for i = 1:T
         rawPhi = PHI_rows{i};
@@ -265,10 +278,21 @@ if opt.ExportPhase
 else
     PHI = []; % not used
 end
+if wantPhase && isempty(PHI)
+    warning('Phase export requested but no valid phase samples were found. Outputs will include amplitude only.');
+end
 
 %% ---------------- Window plan ----------------
-win = max(4, round(opt.WinSec * fs));
-hop = max(1, round(opt.HopSec * fs));
+if ~isempty(opt.WinPackets)
+    win = round(opt.WinPackets);
+else
+    win = max(4, round(opt.WinSec * fs));
+end
+if ~isempty(opt.HopPackets)
+    hop = max(1, round(opt.HopPackets));
+else
+    hop = max(1, round(opt.HopSec * fs));
+end
 exp_frames = win;
 min_frames = max(1, floor(opt.MinFillRatio * exp_frames));
 
@@ -277,6 +301,9 @@ stops  = starts + win - 1;
 if opt.Verbose
     fprintf('[win] time: win=%d (~%.1fs), hop=%d (~%.1fs), min=%d (%.0f%%), candidates=%d\n', ...
         win, win/fs, hop, hop/fs, min_frames, opt.MinFillRatio*100, numel(starts));
+    if ~isempty(opt.WinPackets) || ~isempty(opt.HopPackets)
+        fprintf('      packet override: win=%d pkt, hop=%d pkt\n', win, hop);
+    end
 end
 
 %% ---------------- Subcarrier selection ----------------
@@ -299,6 +326,9 @@ end
 
 %% ---------------- Per-window export ----------------
 exported = 0;
+if isempty(starts) && opt.Verbose
+    warning('Window length (%d) exceeds available packets (%d). No windows exported.', win, T);
+end
 for w = 1:numel(starts)
     idx = starts(w):stops(w);
     if numel(idx) < min_frames, continue; end
@@ -320,9 +350,33 @@ for w = 1:numel(starts)
     Xw = segA(:, keep_idx);     % amplitude export
 
     % --- phase selection for this window (already sanitized globally) ---
-    if opt.ExportPhase && ~isempty(PHI)
+    segP = [];
+    Xpw = [];
+    Xpsc = [];
+    Xfeat = [];
+    if wantPhase && ~isempty(PHI)
         segP = PHI(idx, :);
-        Xpw  = segP(:, keep_idx);
+        segP = segP(:, keep_idx);
+
+        need_raw = opt.ExportPhase && contains(opt.PhaseOutputMode,'raw');
+        need_sincos = (opt.ExportPhase && contains(opt.PhaseOutputMode,'sincos')) || opt.ExportAmpPhaseStack;
+
+        if need_raw
+            Xpw = segP;
+        end
+        if need_sincos
+            sinP = sin(segP);
+            cosP = cos(segP);
+            Xpsc = cat(3, sinP, cosP);
+        end
+        if opt.ExportAmpPhaseStack && ~isempty(segP)
+            if isempty(Xpsc)
+                sinP = sin(segP);
+                cosP = cos(segP);
+                Xpsc = cat(3, sinP, cosP);
+            end
+            Xfeat = cat(3, Xw, Xpsc(:,:,1), Xpsc(:,:,2));
+        end
     end
 
     % --- export ---
@@ -330,9 +384,17 @@ for w = 1:numel(starts)
     xfile = fullfile(winDir, sprintf('X_window_%05d.npy', exported));
     write_npy(xfile, single(Xw));
 
-    if opt.ExportPhase && ~isempty(PHI)
+    if ~isempty(Xpw)
         xpfile = fullfile(winDir, sprintf('Xphase_window_%05d.npy', exported));
         write_npy(xpfile, single(Xpw));
+    end
+    if ~isempty(Xpsc)
+        xpsfile = fullfile(winDir, sprintf('XphaseSC_window_%05d.npy', exported));
+        write_npy(xpsfile, single(Xpsc));
+    end
+    if ~isempty(Xfeat)
+        xffile = fullfile(winDir, sprintf('Xfeat_window_%05d.npy', exported));
+        write_npy(xffile, single(Xfeat));
     end
 
     % meta
@@ -346,6 +408,8 @@ for w = 1:numel(starts)
     meta.WinSec       = opt.WinSec;
     meta.HopSec       = opt.HopSec;
     meta.MinFillRatio = opt.MinFillRatio;
+    meta.WinPackets   = opt.WinPackets;
+    meta.HopPackets   = opt.HopPackets;
     meta.CF_MHz       = CF;
     meta.CBW_MHz      = CBW;
     meta.Nsc_raw      = Nsc;
@@ -354,10 +418,30 @@ for w = 1:numel(starts)
     meta.TrimEdges    = [L R];
     meta.SubsampleStep= opt.SubsampleStep;
     meta.ExportPhase  = opt.ExportPhase;
-    if opt.ExportPhase
+    meta.ExportAmpPhaseStack = opt.ExportAmpPhaseStack;
+    meta.window_shape = size(Xw);
+    if wantPhase
+        meta.PhaseOutputMode = opt.PhaseOutputMode;
+    else
+        meta.PhaseOutputMode = 'none';
+    end
+    if wantPhase
         meta.DoTemporalUnwrap = opt.DoTemporalUnwrap;
         meta.PhaseHighpassHz  = opt.PhaseHighpassHz;
+    end
+    meta.phase_available = ~isempty(Xpw);
+    if ~isempty(Xpw)
         meta.phase_shape      = size(Xpw);
+    end
+    meta.phase_sincos_available = ~isempty(Xpsc);
+    if ~isempty(Xpsc)
+        meta.phase_sincos_shape = size(Xpsc);
+        meta.phase_sincos_order = {'sin','cos'};
+    end
+    meta.amp_phase_stack_available = ~isempty(Xfeat);
+    if ~isempty(Xfeat)
+        meta.amp_phase_stack_shape = size(Xfeat);
+        meta.amp_phase_stack_order = {'amp','sin','cos'};
     end
     meta.y_presence   = opt.y_presence;
     meta.y_loc        = opt.y_loc;
