@@ -14,7 +14,11 @@ from sklearn.model_selection import train_test_split
 # Parameter Settings (Please confirm paths)
 # =========================
 BASE_FOLDER = '/home/tonyliao/WIFI_SENSING_LOCATION'   # Fixed base folder
-CLASSES = ['Empty_FineTune', 'Stationary_FineTune']                      # Binary classification
+CLASSES = ['Empty', 'Stationary']                      # Binary classification (display names)
+CLASS_SOURCE_FOLDERS = {
+    'Empty': 'Empty_FineTune',
+    'Stationary': 'Stationary_FineTune',
+}  # Map display names -> source folders exported from MATLAB
 FILE_EXTENSIONS: Sequence[str] = ('.npz', '.npy', '.jpg', '.jpeg', '.png', '.mat')  # Includes MATLAB metadata
 
 TEST_RATIO = 0.20       # Proportion for test set
@@ -70,6 +74,8 @@ if not os.path.isdir(BASE_FOLDER):
     raise FileNotFoundError(f"Folder not found: {BASE_FOLDER}")
 
 print("Using base folder:", BASE_FOLDER)
+if CLASS_SOURCE_FOLDERS:
+    print("Class source folders:", CLASS_SOURCE_FOLDERS)
 
 
 @dataclass(frozen=True)
@@ -84,10 +90,11 @@ class SampleGroup:
 GROUP_PATTERN = re.compile(r"^(?P<prefix>.+?)_(?P<index>\d+)(?P<ext>\.[^.]+)$")
 
 
-def iter_class_groups(base_folder: str, class_name: str) -> list[SampleGroup]:
-    class_folder = os.path.join(base_folder, class_name)
+def iter_class_groups(base_folder: str, class_name: str, source_folder: str | None = None) -> list[SampleGroup]:
+    folder_name = source_folder or class_name
+    class_folder = os.path.join(base_folder, folder_name)
     if not os.path.isdir(class_folder):
-        print(f"Warning: Class folder not found {class_folder}, skipping.")
+        print(f"Warning: Class folder not found {class_folder} (class '{class_name}'), skipping.")
         return []
 
     grouped: defaultdict[str, list[str]] = defaultdict(list)
@@ -118,7 +125,7 @@ def iter_class_groups(base_folder: str, class_name: str) -> list[SampleGroup]:
 sample_groups: list[SampleGroup] = []
 labels: list[str] = []
 for cls in CLASSES:
-    groups = iter_class_groups(BASE_FOLDER, cls)
+    groups = iter_class_groups(BASE_FOLDER, cls, CLASS_SOURCE_FOLDERS.get(cls))
     sample_groups.extend(groups)
     labels.extend([cls] * len(groups))
 
